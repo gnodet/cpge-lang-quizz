@@ -161,6 +161,92 @@ function generateId() {
     return Date.now().toString(36) + Math.random().toString(36).substr(2);
 }
 
+// Text normalization and fuzzy matching functions
+function normalizeText(text) {
+    return text
+        .toLowerCase()
+        .trim()
+        // Remove extra spaces
+        .replace(/\s+/g, ' ')
+        // Remove common punctuation
+        .replace(/[.,;:!?'"()[\]{}\-_]/g, '')
+        // Remove accents and diacritics
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        // Handle common character substitutions
+        .replace(/[àáâãäå]/g, 'a')
+        .replace(/[èéêë]/g, 'e')
+        .replace(/[ìíîï]/g, 'i')
+        .replace(/[òóôõö]/g, 'o')
+        .replace(/[ùúûü]/g, 'u')
+        .replace(/[ýÿ]/g, 'y')
+        .replace(/[ç]/g, 'c')
+        .replace(/[ñ]/g, 'n')
+        // German specific
+        .replace(/[ä]/g, 'ae')
+        .replace(/[ö]/g, 'oe')
+        .replace(/[ü]/g, 'ue')
+        .replace(/[ß]/g, 'ss');
+}
+
+// Calculate Levenshtein distance for fuzzy matching
+function levenshteinDistance(str1, str2) {
+    const matrix = [];
+
+    for (let i = 0; i <= str2.length; i++) {
+        matrix[i] = [i];
+    }
+
+    for (let j = 0; j <= str1.length; j++) {
+        matrix[0][j] = j;
+    }
+
+    for (let i = 1; i <= str2.length; i++) {
+        for (let j = 1; j <= str1.length; j++) {
+            if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                matrix[i][j] = matrix[i - 1][j - 1];
+            } else {
+                matrix[i][j] = Math.min(
+                    matrix[i - 1][j - 1] + 1, // substitution
+                    matrix[i][j - 1] + 1,     // insertion
+                    matrix[i - 1][j] + 1      // deletion
+                );
+            }
+        }
+    }
+
+    return matrix[str2.length][str1.length];
+}
+
+// Check if answer is approximately correct
+function isApproximatelyCorrect(userAnswer, correctAnswer) {
+    const normalizedUser = normalizeText(userAnswer);
+    const normalizedCorrect = normalizeText(correctAnswer);
+
+    // Exact match after normalization
+    if (normalizedUser === normalizedCorrect) {
+        return { isCorrect: true, similarity: 1.0 };
+    }
+
+    // If one is empty, not a match
+    if (!normalizedUser || !normalizedCorrect) {
+        return { isCorrect: false, similarity: 0 };
+    }
+
+    // Calculate similarity based on Levenshtein distance
+    const distance = levenshteinDistance(normalizedUser, normalizedCorrect);
+    const maxLength = Math.max(normalizedUser.length, normalizedCorrect.length);
+    const similarity = 1 - (distance / maxLength);
+
+    // Accept if similarity is above threshold (85% for short words, 90% for longer words)
+    const threshold = maxLength <= 4 ? 0.75 : maxLength <= 8 ? 0.85 : 0.90;
+
+    return {
+        isCorrect: similarity >= threshold,
+        similarity: similarity
+    };
+}
+
 // Modal functions
 function openModal(listId = null) {
     currentListId = listId;
@@ -437,24 +523,32 @@ function displayCurrentQuestion() {
 function submitQuizAnswer() {
     if (!currentQuiz || waitingForUserClick) return;
 
-    const userAnswer = quizAnswer.value.trim().toLowerCase();
-    const correctAnswer = currentQuiz.questions[currentQuiz.currentQuestionIndex].expectedAnswer.toLowerCase();
+    const userAnswer = quizAnswer.value.trim();
+    const correctAnswer = currentQuiz.questions[currentQuiz.currentQuestionIndex].expectedAnswer;
     const currentQuestion = currentQuiz.questions[currentQuiz.currentQuestionIndex];
-    const isCorrect = userAnswer === correctAnswer;
+
+    // Use fuzzy matching to check if answer is approximately correct
+    const matchResult = isApproximatelyCorrect(userAnswer, correctAnswer);
+    const isCorrect = matchResult.isCorrect;
 
     // Record the result for learning analytics
     recordWordResult(currentQuiz.listId, currentQuestion.word.id, isCorrect);
 
     if (isCorrect) {
         currentQuiz.score++;
-        showFeedback(true);
+        // Show different feedback for exact vs approximate matches
+        if (matchResult.similarity === 1.0) {
+            showFeedback(true, '', 'perfect');
+        } else {
+            showFeedback(true, correctAnswer, 'approximate');
+        }
         // Correct answers proceed automatically after short delay
         setTimeout(() => {
             currentQuiz.currentQuestionIndex++;
             displayCurrentQuestion();
         }, 1500);
     } else {
-        showFeedback(false, correctAnswer);
+        showFeedback(false, correctAnswer, 'incorrect');
         // For incorrect answers, wait for user click to proceed
         waitingForUserClick = true;
         showContinueButton();
@@ -479,12 +573,28 @@ function skipQuizQuestion() {
 }
 
 // Show feedback
-function showFeedback(isCorrect, correctAnswer = '') {
+function showFeedback(isCorrect, correctAnswer = '', feedbackType = 'normal') {
     const feedbackDiv = document.createElement('div');
-    feedbackDiv.className = `fixed top-4 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-lg text-white font-medium z-50 ${
-        isCorrect ? 'bg-green-500' : 'bg-red-500'
-    }`;
-    feedbackDiv.textContent = isCorrect ? '✓ Correct !' : `✗ Réponse: ${correctAnswer}`;
+
+    let bgColor, message;
+    if (isCorrect) {
+        if (feedbackType === 'perfect') {
+            bgColor = 'bg-green-500';
+            message = '✓ Parfait !';
+        } else if (feedbackType === 'approximate') {
+            bgColor = 'bg-blue-500';
+            message = `✓ Correct ! (Réponse exacte: ${correctAnswer})`;
+        } else {
+            bgColor = 'bg-green-500';
+            message = '✓ Correct !';
+        }
+    } else {
+        bgColor = 'bg-red-500';
+        message = `✗ Réponse: ${correctAnswer}`;
+    }
+
+    feedbackDiv.className = `fixed top-4 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-lg text-white font-medium z-50 max-w-xs text-center ${bgColor}`;
+    feedbackDiv.textContent = message;
     feedbackDiv.id = 'feedback-message';
 
     document.body.appendChild(feedbackDiv);
@@ -495,7 +605,7 @@ function showFeedback(isCorrect, correctAnswer = '') {
             if (document.getElementById('feedback-message')) {
                 document.body.removeChild(feedbackDiv);
             }
-        }, 1500);
+        }, feedbackType === 'approximate' ? 2500 : 1500); // Longer display for approximate matches
     }
     // For incorrect answers, keep displayed until user clicks continue
 }
