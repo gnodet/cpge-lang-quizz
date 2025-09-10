@@ -2,6 +2,8 @@
 let vocabularyLists = [];
 let currentQuiz = null;
 let currentListId = null;
+let quizStatistics = {}; // Track word performance: { listId: { wordId: { correct: 0, incorrect: 0, lastIncorrect: timestamp } } }
+let waitingForUserClick = false; // Flag to control answer display
 
 // DOM elements
 const listsTab = document.getElementById('listsTab');
@@ -40,6 +42,7 @@ const newQuiz = document.getElementById('newQuiz');
 // Initialize app
 document.addEventListener('DOMContentLoaded', function() {
     loadVocabularyLists();
+    loadQuizStatistics();
     setupEventListeners();
     renderLists();
     renderQuizLists();
@@ -101,6 +104,56 @@ function loadVocabularyLists() {
 
 function saveVocabularyLists() {
     localStorage.setItem('vocabularyLists', JSON.stringify(vocabularyLists));
+}
+
+function loadQuizStatistics() {
+    const stored = localStorage.getItem('quizStatistics');
+    quizStatistics = stored ? JSON.parse(stored) : {};
+}
+
+function saveQuizStatistics() {
+    localStorage.setItem('quizStatistics', JSON.stringify(quizStatistics));
+}
+
+// Track word performance
+function recordWordResult(listId, wordId, isCorrect) {
+    if (!quizStatistics[listId]) {
+        quizStatistics[listId] = {};
+    }
+    if (!quizStatistics[listId][wordId]) {
+        quizStatistics[listId][wordId] = { correct: 0, incorrect: 0, lastIncorrect: null };
+    }
+
+    if (isCorrect) {
+        quizStatistics[listId][wordId].correct++;
+    } else {
+        quizStatistics[listId][wordId].incorrect++;
+        quizStatistics[listId][wordId].lastIncorrect = Date.now();
+    }
+
+    saveQuizStatistics();
+}
+
+// Get words that need more practice (recently incorrect or high error rate)
+function getWordsNeedingPractice(listId, allWords) {
+    if (!quizStatistics[listId]) return allWords;
+
+    const now = Date.now();
+    const oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000); // 1 week in milliseconds
+
+    return allWords.filter(word => {
+        const stats = quizStatistics[listId][word.id];
+        if (!stats) return true; // New words need practice
+
+        // Include if recently incorrect (within last week)
+        if (stats.lastIncorrect && stats.lastIncorrect > oneWeekAgo) return true;
+
+        // Include if error rate is high (more than 30% incorrect)
+        const totalAttempts = stats.correct + stats.incorrect;
+        if (totalAttempts >= 3 && (stats.incorrect / totalAttempts) > 0.3) return true;
+
+        return false;
+    });
 }
 
 // Generate unique ID
@@ -272,8 +325,33 @@ function startQuiz(listId) {
     const list = vocabularyLists.find(l => l.id === listId);
     if (!list || list.words.length === 0) return;
 
-    // Shuffle words and create questions
-    const shuffledWords = [...list.words].sort(() => Math.random() - 0.5);
+    // Get words that need more practice
+    const wordsNeedingPractice = getWordsNeedingPractice(listId, list.words);
+    const otherWords = list.words.filter(word => !wordsNeedingPractice.includes(word));
+
+    // Prioritize words needing practice (70% of quiz) + some random words (30%)
+    let selectedWords = [];
+    const practiceCount = Math.min(wordsNeedingPractice.length, Math.ceil(list.words.length * 0.7));
+    const randomCount = Math.min(otherWords.length, list.words.length - practiceCount);
+
+    // Add words needing practice
+    selectedWords = [...wordsNeedingPractice.slice(0, practiceCount)];
+
+    // Add some random words for variety
+    if (randomCount > 0) {
+        const shuffledOthers = [...otherWords].sort(() => Math.random() - 0.5);
+        selectedWords = [...selectedWords, ...shuffledOthers.slice(0, randomCount)];
+    }
+
+    // If we don't have enough words, fill with remaining words
+    if (selectedWords.length < list.words.length) {
+        const remaining = list.words.filter(word => !selectedWords.includes(word));
+        selectedWords = [...selectedWords, ...remaining];
+    }
+
+    // Shuffle the final selection
+    const shuffledWords = [...selectedWords].sort(() => Math.random() - 0.5);
+
     const questions = shuffledWords.map(word => {
         const questionLanguage = Math.random() < 0.5 ? 'french' : list.language;
         return {
@@ -339,40 +417,65 @@ function displayCurrentQuestion() {
     }
 
     quizAnswer.value = '';
+
+    // Reset UI state
+    waitingForUserClick = false;
+    quizAnswer.disabled = false;
+    submitAnswer.disabled = false;
+    skipQuestion.disabled = false;
+
+    // Hide continue button if it exists
+    const continueBtn = document.getElementById('continue-btn');
+    if (continueBtn) {
+        continueBtn.style.display = 'none';
+    }
+
     quizAnswer.focus();
 }
 
 // Submit quiz answer
 function submitQuizAnswer() {
-    if (!currentQuiz) return;
+    if (!currentQuiz || waitingForUserClick) return;
 
     const userAnswer = quizAnswer.value.trim().toLowerCase();
     const correctAnswer = currentQuiz.questions[currentQuiz.currentQuestionIndex].expectedAnswer.toLowerCase();
+    const currentQuestion = currentQuiz.questions[currentQuiz.currentQuestionIndex];
+    const isCorrect = userAnswer === correctAnswer;
 
-    if (userAnswer === correctAnswer) {
+    // Record the result for learning analytics
+    recordWordResult(currentQuiz.listId, currentQuestion.word.id, isCorrect);
+
+    if (isCorrect) {
         currentQuiz.score++;
         showFeedback(true);
+        // Correct answers proceed automatically after short delay
+        setTimeout(() => {
+            currentQuiz.currentQuestionIndex++;
+            displayCurrentQuestion();
+        }, 1500);
     } else {
         showFeedback(false, correctAnswer);
+        // For incorrect answers, wait for user click to proceed
+        waitingForUserClick = true;
+        showContinueButton();
     }
-
-    setTimeout(() => {
-        currentQuiz.currentQuestionIndex++;
-        displayCurrentQuestion();
-    }, 1500);
 }
 
 // Skip question
 function skipQuizQuestion() {
-    if (!currentQuiz) return;
+    if (!currentQuiz || waitingForUserClick) return;
 
-    const correctAnswer = currentQuiz.questions[currentQuiz.currentQuestionIndex].expectedAnswer;
+    const currentQuestion = currentQuiz.questions[currentQuiz.currentQuestionIndex];
+    const correctAnswer = currentQuestion.expectedAnswer;
+
+    // Record as incorrect since it was skipped
+    recordWordResult(currentQuiz.listId, currentQuestion.word.id, false);
+
     showFeedback(false, correctAnswer);
 
-    setTimeout(() => {
-        currentQuiz.currentQuestionIndex++;
-        displayCurrentQuestion();
-    }, 1500);
+    // For skipped questions, wait for user click to proceed
+    waitingForUserClick = true;
+    showContinueButton();
 }
 
 // Show feedback
@@ -382,12 +485,69 @@ function showFeedback(isCorrect, correctAnswer = '') {
         isCorrect ? 'bg-green-500' : 'bg-red-500'
     }`;
     feedbackDiv.textContent = isCorrect ? '✓ Correct !' : `✗ Réponse: ${correctAnswer}`;
+    feedbackDiv.id = 'feedback-message';
 
     document.body.appendChild(feedbackDiv);
 
-    setTimeout(() => {
+    // For correct answers, remove automatically
+    if (isCorrect) {
+        setTimeout(() => {
+            if (document.getElementById('feedback-message')) {
+                document.body.removeChild(feedbackDiv);
+            }
+        }, 1500);
+    }
+    // For incorrect answers, keep displayed until user clicks continue
+}
+
+// Show continue button for incorrect answers
+function showContinueButton() {
+    // Disable answer input and submit button
+    quizAnswer.disabled = true;
+    submitAnswer.disabled = true;
+    skipQuestion.disabled = true;
+
+    // Create or show continue button
+    let continueBtn = document.getElementById('continue-btn');
+    if (!continueBtn) {
+        continueBtn = document.createElement('button');
+        continueBtn.id = 'continue-btn';
+        continueBtn.className = 'w-full bg-blue-500 hover:bg-blue-600 text-white font-medium py-3 px-4 rounded-lg transition-colors mt-4';
+        continueBtn.textContent = 'Continuer (j\'ai mémorisé)';
+        continueBtn.addEventListener('click', continueToNextQuestion);
+
+        // Insert after the quiz answer input
+        quizAnswer.parentNode.insertBefore(continueBtn, quizAnswer.nextSibling);
+    }
+
+    continueBtn.style.display = 'block';
+    continueBtn.focus();
+}
+
+// Continue to next question
+function continueToNextQuestion() {
+    waitingForUserClick = false;
+
+    // Re-enable controls
+    quizAnswer.disabled = false;
+    submitAnswer.disabled = false;
+    skipQuestion.disabled = false;
+
+    // Hide continue button
+    const continueBtn = document.getElementById('continue-btn');
+    if (continueBtn) {
+        continueBtn.style.display = 'none';
+    }
+
+    // Remove feedback message
+    const feedbackDiv = document.getElementById('feedback-message');
+    if (feedbackDiv) {
         document.body.removeChild(feedbackDiv);
-    }, 1500);
+    }
+
+    // Move to next question
+    currentQuiz.currentQuestionIndex++;
+    displayCurrentQuestion();
 }
 
 // End quiz session
